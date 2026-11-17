@@ -1,0 +1,774 @@
+"""
+TACTILE LOCAL-GLOBAL SYNCHRONISED WITH THE ECG (test version)
+-------------------------------------------------------------
+- 4 tactile blocks (monotone/discordant x left/right), random order.
+- Fixation cross only (no visual task).
+- 25 habituation + 120-130 test trials per block, 20% Global Deviants.
+- Electrical stimulator ON/OFF (start-up dialog):
+    * ON : full trigger (bits 64/128 drive the stimulators, pins 8/9).
+    * OFF: same trigger WITHOUT bits 64/128 -> the EEG gets the marker, no stimulation.
+- Real-time ECG via RDA (BrainVision Recorder, 32-bit port 51244).
+
+ECG ALGORITHM
+- Online R-peak detection (5-30 Hz band-pass + adaptive threshold + refinement on the raw signal).
+- Predicted R = last R + mean of the last 8 valid RR intervals (300-2000 ms).
+- Beat 1 at predicted R - 270 ms. SOA 150 ms -> beat 4 at R+180, beat 5 at R+330.
+  Beats 2 and 3 are not sent (as in the original script).
+- ITI: beat 1 can only be sent if >= ITI_req has elapsed since the previous beat 5,
+  with ITI_req drawn at random from 1350-1650 ms. Otherwise, wait for the next R.
+
+RDA LATENCY
+- Sample times are anchored to the PC clock using the arrival of the RDA blocks.
+- If the triggers come back through RDA as markers, they are used to correct the
+  remaining latency (automatic correction, printed to the console).
+
+BEFORE STARTING ON THE PLATFORM
+- In Recorder: enable Remote Data Access (Configuration > Preferences) and be in monitoring/recording.
+- Enter the IP of the Recorder computer and the exact ECG channel name in the dialog.
+- "Simulation" mode: synthetic ECG from a local RDA server, to test without the platform.
+"""
+
+import os
+import re
+import sys
+import time
+import random
+import socket
+import struct
+import threading
+from collections import deque
+
+import numpy as np
+import pandas as pd
+from scipy.signal import butter, sosfilt, sosfilt_zi
+from psychopy import core, parallel, gui, visual, event
+
+# ==============================================================================
+# 1. PARAMETERS
+# ==============================================================================
+# --- Experimental structure ---
+HABITUATION_TRIALS = 25
+N_TEST_RANGE = (120, 130)
+GLOBAL_DEVIANT_PCT = 0.20
+
+# --- Timing ---
+SOA_MS = 150
+ACTIVE_BEATS = [1, 4, 5]
+ITI_VALUES = range(1350, 1651, 50)      # minimum beat5 -> next beat1 (+ jitter)
+PRE_STIM_BUFFER = 8.0
+POST_STIM_BUFFER = 8.0
+
+# --- ECG synchronisation ---
+B1_BEFORE_R_MS = 270                    # beat 1 at R - 270 ms
+N_RR_MEAN = 8                           # mean of the last 8 RR intervals
+RR_MIN_S, RR_MAX_S = 0.30, 2.00         # RR outside this range are excluded from the mean
+LATE_TOL_S = 0.005                      # if the target time has passed by more than this, wait for the next R
+NO_ECG_WARN_S = 2.5                     # warning if no R is detected for this long
+
+# --- R-peak detector ---
+BP_LOW_HZ, BP_HIGH_HZ = 5.0, 30.0
+THRESH_FRAC = 0.45                      # threshold = fraction of the typical QRS amplitude
+REFRACTORY_S = 0.25
+WIN_BEFORE_S, WIN_AFTER_S = 0.05, 0.08  # window to locate the R peak around the threshold crossing
+CALIB_S = 4.0                           # initial seconds used to calibrate threshold and polarity
+LOST_S = 3.0                            # if no R for this long, the threshold is lowered
+
+# --- RDA ---
+RDA_HOST_DEFAULT = "localhost"          # IP of the Recorder computer
+RDA_PORT = 51244                        # 32-bit (float)
+ECG_CHANNEL_DEFAULT = "ECG"
+ANCHOR_WINDOW_BLOCKS = 200              # blocks used to estimate the PC clock <-> sample anchor
+SIM_PORT = 51299
+
+# --- Hardware ---
+EEG_PORT_ADDRESS = 0x0378
+PULSE_DURATION_S = 0.005
+
+# --- CSV output (Excel in Spanish/French: ";" separator and "," decimal) ---
+# To read in Python: pd.read_csv(file, sep=";", decimal=",")
+CSV_SEP = ";"
+CSV_DECIMAL = ","
+
+# --- Visual ---
+BG_COLOR = [0.5, 0.5, 0.5]
+
+sys.setswitchinterval(0.0005)
+
+
+class EscapePressed(Exception):
+    pass
+
+
+# ==============================================================================
+# 2. TRIGGERS (8 BITS)
+# ==============================================================================
+def encode_trigger(beat, side, local_kind, global_kind, is_visual_task=False):
+    """
+    [Bit 7]: Right Stim (128) -> Pin 9
+    [Bit 6]: Left Stim  (64)  -> Pin 8
+    [Bit 5]: Task Type  (32)  -> Pin 7
+    [Bit 4]: Global Dev (16)  -> Pin 6
+    [Bit 3]: Local Dev  (8)   -> Pin 5
+    [Bit 0-2]: Beat (1-7)     -> Pin 2,3,4
+    """
+    trigger = beat & 0b111
+    if local_kind == 'LD': trigger |= 8
+    if global_kind == 'GD': trigger |= 16
+    if is_visual_task: trigger |= 32
+    if side == "left": trigger |= 64
+    elif side == "right": trigger |= 128
+    return trigger
+
+
+def decode_trigger_to_text(trig):
+    if trig == 0: return "No Trigger"
+    side = "RIGHT" if (trig & 128) else ("LEFT" if (trig & 64) else "NONE")
+    task = "VIS" if (trig & 32) else "TAC"
+    glob = "GlobDEV" if (trig & 16) else "GlobSTD"
+    loc = "LocDEV" if (trig & 8) else "LocSTD"
+    return f"[{task}] {side} | {loc}-{glob} | Beat {trig & 7} (Code: {trig})"
+
+
+# ==============================================================================
+# 3. REAL-TIME ECG
+# ==============================================================================
+class SampleClock:
+    """Converts sample index -> PC clock (core.getTime)."""
+
+    def __init__(self, dt):
+        self.dt = dt
+        self.cands = deque(maxlen=ANCHOR_WINDOW_BLOCKS)
+        self.marker_offsets = deque(maxlen=20)
+        self.delays = deque(maxlen=3000)
+
+    def on_block(self, n_end, t_arr):
+        self.cands.append(t_arr - n_end * self.dt)
+        self.delays.append(t_arr - (self.t0 + n_end * self.dt))
+
+    @property
+    def t0(self):
+        return min(self.cands)
+
+    @property
+    def correction(self):
+        return float(np.median(self.marker_offsets)) if self.marker_offsets else 0.0
+
+    def to_time(self, idx, corrected=True):
+        return self.t0 + idx * self.dt + (self.correction if corrected else 0.0)
+
+
+class RPeakDetector:
+    def __init__(self, fs, polarity="auto"):
+        self.fs = fs
+        self.sos = butter(2, [BP_LOW_HZ, BP_HIGH_HZ], btype="bandpass", fs=fs, output="sos")
+        self.zi = None
+        self.raw = np.empty(0)
+        self.d = np.empty(0)
+        self.base = 0
+        self.n = 0
+        self.polarity = {"positive": 1, "negative": -1}.get(polarity)
+        self.calibrated = False
+        self.amp_hist = deque(maxlen=8)
+        self.thr = np.inf
+        self.scan = 0
+        self.cross = None
+        self.last_r = -10 ** 9
+        self.last_lower = 0
+        self.r_idx = []
+        self.r_amp = []
+
+    def add(self, x):
+        x = np.asarray(x, dtype=float)
+        if self.zi is None:
+            self.zi = sosfilt_zi(self.sos) * x[0]
+        y, self.zi = sosfilt(self.sos, x, zi=self.zi)
+        self.raw = np.concatenate([self.raw, x])
+        self.d = np.concatenate([self.d, np.abs(y)])
+        self.n += len(x)
+        keep = int(12 * self.fs)
+        if len(self.raw) > keep:
+            cut = len(self.raw) - keep
+            self.raw = self.raw[cut:]
+            self.d = self.d[cut:]
+            self.base += cut
+        if not self.calibrated:
+            if self.n >= CALIB_S * self.fs:
+                self._calibrate()
+            return
+        self._scan()
+        # if no R for LOST_S seconds, halve the threshold (at most once every LOST_S)
+        if self.cross is None and self.n - max(self.last_r, self.last_lower) > LOST_S * self.fs:
+            self.thr *= 0.5
+            self.amp_hist.clear()
+            self.amp_hist.append(self.thr / THRESH_FRAC)
+            self.last_lower = self.n
+            self.scan = self.n - int(LOST_S * self.fs)
+            print("[ECG] No R detected: lowering threshold")
+            self._scan()
+
+    def _calibrate(self):
+        start = self.base + int(0.5 * self.fs)
+        d = self.d[start - self.base:]
+        amp0 = np.percentile(d, 99.5)
+        self.thr = THRESH_FRAC * amp0
+        self.amp_hist.append(amp0)
+        if self.polarity is None:
+            wb, wa = int(WIN_BEFORE_S * self.fs), int(WIN_AFTER_S * self.fs)
+            refr = int(REFRACTORY_S * self.fs)
+            pos = neg = 0.0
+            i = start
+            while True:
+                hits = np.nonzero(self.d[i - self.base:] > self.thr)[0]
+                if len(hits) == 0: break
+                c = i + hits[0]
+                if c + wa > self.n: break
+                w = self.raw[max(c - wb, self.base) - self.base:c + wa - self.base]
+                med = np.median(w)
+                pos += w.max() - med
+                neg += med - w.min()
+                i = c + refr
+            self.polarity = 1 if pos >= neg else -1
+        self.scan = start
+        self.calibrated = True
+        print(f"[ECG] Calibrated: polarity {'+' if self.polarity > 0 else '-'}, threshold {self.thr:.1f}")
+        self._scan()
+
+    def _scan(self):
+        refr = int(REFRACTORY_S * self.fs)
+        wb, wa = int(WIN_BEFORE_S * self.fs), int(WIN_AFTER_S * self.fs)
+        while True:
+            if self.cross is None:
+                start = max(self.scan, self.last_r + refr, self.base)
+                if start >= self.n: break
+                hits = np.nonzero(self.d[start - self.base:] > self.thr)[0]
+                if len(hits) == 0:
+                    self.scan = self.n
+                    break
+                self.cross = start + hits[0]
+            if self.n < self.cross + wa: break
+            lo = max(self.cross - wb, self.base)
+            hi = self.cross + wa
+            w = self.raw[lo - self.base:hi - self.base]
+            r = lo + int(np.argmax(self.polarity * (w - np.median(w))))
+            amp = float(self.d[lo - self.base:hi - self.base].max())
+            self.amp_hist.append(amp)
+            self.thr = THRESH_FRAC * float(np.median(self.amp_hist))
+            self.r_idx.append(r)
+            self.r_amp.append(amp)
+            self.last_r = r
+            self.scan = hi
+            self.cross = None
+
+
+class ECGStream(threading.Thread):
+    """Background RDA client: reads the ECG channel and detects R peaks."""
+
+    def __init__(self, host, port, channel, polarity):
+        super().__init__(daemon=True)
+        self.host, self.port, self.channel, self.polarity = host, port, channel, polarity
+        self.lock = threading.Lock()
+        self.running = True
+        self.sock = None
+        self.det = None
+        self.clock = None
+        self.sent = deque(maxlen=60)       # [t_sent, code, matched]
+        self.marker_log = []
+        self.status = "connecting"
+        self.n_overflows = 0
+
+    # --- RDA protocol ---
+    def _recv(self, n):
+        buf = bytearray()
+        while len(buf) < n:
+            chunk = self.sock.recv(n - len(buf))
+            if not chunk:
+                raise ConnectionError("RDA connection closed")
+            buf += chunk
+        return buf
+
+    @staticmethod
+    def _split(raw):
+        return [s.decode("latin-1") for s in bytes(raw).split(b"\x00")[:-1]]
+
+    def run(self):
+        while self.running:
+            try:
+                self.sock = socket.create_connection((self.host, self.port), timeout=3)
+                self.sock.settimeout(None)
+                print(f"[RDA] Connected to {self.host}:{self.port}")
+                self.status = "connected, waiting for data"
+                self._loop()
+            except Exception as e:
+                if not self.running: break
+                self.status = f"not connected ({e})"
+                print(f"[RDA] {self.status}. Retrying in 2 s...")
+                time.sleep(2)
+
+    def _loop(self):
+        nch = ecg_i = None
+        res = 1.0
+        n_samples = 0
+        last_block = -1
+        while self.running:
+            hdr = self._recv(24)
+            _, _, _, _, msgsize, msgtype = struct.unpack("<llllLL", hdr)
+            raw = self._recv(msgsize - 24)
+            t_arr = core.getTime()
+            if msgtype == 1:
+                nch, sint = struct.unpack("<Ld", raw[:12])
+                resolutions = struct.unpack(f"<{nch}d", raw[12:12 + 8 * nch])
+                names = self._split(raw[12 + 8 * nch:])
+                low = [n.lower() for n in names]
+                if self.channel.lower() not in low:
+                    self.status = f"channel '{self.channel}' not found. Channels: {names}"
+                    print(f"[RDA] ERROR: {self.status}")
+                    raise ConnectionError(self.status)
+                ecg_i = low.index(self.channel.lower())
+                res = resolutions[ecg_i]
+                fs = 1e6 / sint
+                with self.lock:
+                    self.det = RPeakDetector(fs, self.polarity)
+                    self.clock = SampleClock(1.0 / fs)
+                n_samples, last_block = 0, -1
+                self.status = "receiving"
+                print(f"[RDA] Start: {nch} channels, fs = {fs:.0f} Hz, ECG = '{names[ecg_i]}'")
+            elif msgtype == 4 and nch is not None:
+                block, points, n_mk = struct.unpack("<LLL", raw[:12])
+                if last_block != -1 and block > last_block + 1:
+                    missed = (block - last_block - 1) * points
+                    self.n_overflows += 1
+                    print(f"[RDA] *** Overflow: {block - last_block - 1} blocks lost ***")
+                    with self.lock:
+                        self.det.add(np.full(missed, self.det.raw[-1] if len(self.det.raw) else 0.0))
+                    n_samples += missed
+                last_block = block
+                data = np.frombuffer(bytes(raw[12:12 + 4 * points * nch]), dtype="<f4")
+                ecg = data.reshape(points, nch)[:, ecg_i].astype(float) * res
+                block_start = n_samples
+                n_samples += points
+                with self.lock:
+                    self.clock.on_block(n_samples, t_arr)
+                    self.det.add(ecg)
+                idx = 12 + 4 * points * nch
+                for _ in range(n_mk):
+                    msize = struct.unpack("<L", raw[idx:idx + 4])[0]
+                    pos, _pts, _ch = struct.unpack("<LLl", raw[idx + 4:idx + 16])
+                    td = self._split(raw[idx + 16:idx + msize]) + ["", ""]
+                    self._on_marker(block_start + pos, td[0], td[1])
+                    idx += msize
+            elif msgtype == 3:
+                self.status = "Recorder stopped"
+                print("[RDA] Stop received")
+
+    def _on_marker(self, abs_pos, mtype, desc):
+        with self.lock:
+            est = self.clock.to_time(abs_pos, corrected=False)
+            m = re.search(r"(\d+)", desc)
+            code = int(m.group(1)) if m else None
+            best = None
+            for s in self.sent:
+                if s[2]: continue
+                dtm = s[0] - est
+                if abs(dtm) > 0.15: continue
+                if code is not None and code != s[1] and abs(dtm) > 0.05: continue
+                if best is None or abs(dtm) < abs(best[0] - est): best = s
+            offset = None
+            if best is not None and code is not None:
+                best[2] = True
+                offset = best[0] - est
+                self.clock.marker_offsets.append(offset)
+            self.marker_log.append({"t_pc_est": est, "type": mtype, "desc": desc,
+                                    "matched_t_sent": best[0] if best else np.nan,
+                                    "offset_ms": offset * 1000 if offset is not None else np.nan})
+
+    # --- interface for the experiment ---
+    def register_sent(self, t, code):
+        with self.lock:
+            self.sent.append([t, code, False])
+
+    def prediction(self):
+        """(last R, mean RR, predicted R) on the PC clock, or None if there are not 8 valid RR."""
+        with self.lock:
+            if self.det is None or not self.det.calibrated or len(self.det.r_idx) < 2:
+                return None
+            idx = np.array(self.det.r_idx[-(N_RR_MEAN * 2 + 1):])
+            t = self.clock.to_time(idx)
+        rr = np.diff(t)
+        rr = rr[(rr >= RR_MIN_S) & (rr <= RR_MAX_S)]
+        if len(rr) < N_RR_MEAN:
+            return None
+        rr_mean = float(rr[-N_RR_MEAN:].mean())
+        return t[-1], rr_mean, t[-1] + rr_mean
+
+    def r_times(self):
+        with self.lock:
+            if self.det is None: return np.array([]), np.array([])
+            return self.clock.to_time(np.array(self.det.r_idx, dtype=float)), np.array(self.det.r_amp)
+
+    def latency_report(self):
+        with self.lock:
+            if self.clock is None or not self.clock.delays: return "no data"
+            d = np.array(self.clock.delays) * 1000
+            corr = self.clock.correction * 1000
+            nm = len(self.clock.marker_offsets)
+        return (f"RDA arrival jitter: median {np.median(d):.1f} ms, p95 {np.percentile(d, 95):.1f} ms | "
+                f"marker-based correction: {corr:+.1f} ms ({nm} markers) | overflows: {self.n_overflows}")
+
+    def stop(self):
+        self.running = False
+        try: self.sock.close()
+        except Exception: pass
+
+
+# ==============================================================================
+# 4. RDA SIMULATOR ("Simulation" mode only)
+# ==============================================================================
+class RDASimServer(threading.Thread):
+    """Local RDA server with a synthetic ECG. Sent triggers come back as markers."""
+
+    def __init__(self, port=SIM_PORT, fs=5000, block_s=0.02, hr_bpm=72, polarity=1):
+        super().__init__(daemon=True)
+        self.port, self.fs, self.dt, self.block_s = port, fs, 1.0 / fs, block_s
+        self.rr0, self.pol = 60.0 / hr_bpm, polarity
+        self.names = ["Fz", "Cz", "ECG"]
+        self.pending = []
+        self.lock = threading.Lock()
+        self.true_r = []           # true R times on the PC clock
+        self.beats = [0.5]
+        self.running = True
+        self.srv = socket.socket()
+        self.srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.srv.bind(("127.0.0.1", port))
+        self.srv.listen(1)
+
+    def add_marker(self, code):
+        with self.lock:
+            pos = int(round((core.getTime() - self.t_start) / self.dt))
+            self.pending.append((pos, code))
+
+    def _ecg(self, n0, n1):
+        t = np.arange(n0, n1) * self.dt
+        while self.beats[-1] < t[-1] + 2:
+            k = len(self.beats)
+            self.beats.append(self.beats[-1] + self.rr0 * (1 + 0.06 * np.sin(2 * np.pi * k / 12))
+                              + random.gauss(0, 0.02))
+        y = 100 * np.sin(2 * np.pi * 0.3 * t) + 30 * np.sin(2 * np.pi * 50 * t) + np.random.randn(len(t)) * 20
+        comps = [(-0.16, 150, 0.025), (-0.025, -100, 0.008), (0, 1000, 0.010),
+                 (0.025, -250, 0.008), (0.25, 300, 0.040)]   # P, Q, R, S, T waves
+        for b in self.beats:
+            if t[0] - 0.5 < b < t[-1] + 0.5:
+                for off, a, w in comps:
+                    y += self.pol * a * np.exp(-0.5 * ((t - b - off) / w) ** 2)
+        return y
+
+    @staticmethod
+    def _msg(mtype, payload):
+        return struct.pack("<llllLL", 1, 2, 3, 4, 24 + len(payload), mtype) + payload
+
+    def run(self):
+        conn, _ = self.srv.accept()
+        nch = len(self.names)
+        payload = struct.pack("<Ld", nch, self.dt * 1e6) + struct.pack(f"<{nch}d", *([0.1] * nch))
+        payload += b"".join(n.encode() + b"\x00" for n in self.names)
+        conn.sendall(self._msg(1, payload))
+        self.t_start = core.getTime()
+        n_sent, block = 0, 0
+        while self.running:
+            time.sleep(self.block_s)
+            n_now = int((core.getTime() - self.t_start) / self.dt)
+            if n_now <= n_sent: continue
+            ecg = self._ecg(n_sent, n_now)
+            data = np.random.randn(n_now - n_sent, nch) * 10
+            data[:, 2] = ecg
+            data = (data / 0.1).astype("<f4")
+            with self.lock:
+                mk = [(p, c) for p, c in self.pending if p < n_now]
+                self.pending = [(p, c) for p, c in self.pending if p >= n_now]
+            mbytes = b""
+            for p, c in mk:
+                s = b"Stimulus\x00" + f"S{c:3d}".encode() + b"\x00"
+                mbytes += struct.pack("<LLLl", 16 + len(s), max(p - n_sent, 0), 1, -1) + s
+            payload = struct.pack("<LLL", block, n_now - n_sent, len(mk)) + data.tobytes() + mbytes
+            time.sleep(random.uniform(0.003, 0.025))      # simulated network latency
+            try:
+                conn.sendall(self._msg(4, payload))
+            except OSError:
+                break
+            self.true_r = [self.t_start + b for b in self.beats if b < n_now * self.dt]
+            n_sent, block = n_now, block + 1
+
+
+# ==============================================================================
+# 5. TRIAL GENERATOR (same as the original)
+# ==============================================================================
+def generate_trials(block_type, base_side):
+    side_alt = "left" if base_side == "right" else "right"
+    seq_LS = {"sides": [base_side] * 5, "local_kind": "LS"}
+    seq_LD = {"sides": [base_side] * 4 + [side_alt], "local_kind": "LD"}
+    if block_type == 'monotone':
+        item_std = {**seq_LS, "global_kind": "GS"}
+        item_dev = {**seq_LD, "global_kind": "GD"}
+    else:
+        item_std = {**seq_LD, "global_kind": "GS"}
+        item_dev = {**seq_LS, "global_kind": "GD"}
+
+    trials = [{**item_std, "phase": "habituation"} for _ in range(HABITUATION_TRIALS)]
+    n_total = random.randint(*N_TEST_RANGE)
+    n_dev = int(round(n_total * GLOBAL_DEVIANT_PCT))
+    pool = [{**item_std, "phase": "test"} for _ in range(n_total - n_dev)]
+    pool += [{**item_dev, "phase": "test"} for _ in range(n_dev)]
+    while True:   # no two consecutive global deviants
+        random.shuffle(pool)
+        if not any(pool[i]['global_kind'] == 'GD' and pool[i + 1]['global_kind'] == 'GD'
+                   for i in range(len(pool) - 1)):
+            break
+    return trials + pool
+
+
+# ==============================================================================
+# 6. EXPERIMENT
+# ==============================================================================
+class Experiment:
+    def __init__(self, port, stream, stim_on, win, out_dir, sim=None):
+        self.port, self.stream, self.stim_on, self.win = port, stream, stim_on, win
+        self.out_dir, self.sim = out_dir, sim
+        self.fix = visual.TextStim(win, text='+', height=0.05, color='black')
+        self.instr = visual.TextStim(win, height=0.04, color='black', wrapWidth=1.2)
+        self._last_esc = 0.0
+
+    def check_escape(self, force=False):
+        now = core.getTime()
+        if force or now - self._last_esc > 0.05:
+            self._last_esc = now
+            if event.getKeys(keyList=['escape']):
+                raise EscapePressed()
+
+    def wait_until(self, t):
+        # sleep while far away, busy-wait during the last 25 ms for precise timing
+        while True:
+            rem = t - core.getTime()
+            if rem <= 0: return
+            if rem > 0.025:
+                time.sleep(0.001)
+                self.check_escape()
+
+    def send_trigger(self, code):
+        out = code if self.stim_on else (code & 0x3F)   # OFF: remove stimulator bits 64/128
+        t = core.getTime()
+        self.port.setData(int(out))
+        self.stream.register_sent(t, out)
+        core.wait(PULSE_DURATION_S)
+        self.port.setData(0)
+        return t, out
+
+    def show_text(self, msg):
+        self.instr.text = msg
+        self.instr.draw()
+        self.win.flip()
+
+    def wait_for_ecg(self):
+        last = 0
+        while self.stream.prediction() is None:
+            if core.getTime() - last > 0.5:
+                last = core.getTime()
+                n = len(self.stream.r_times()[0])
+                self.show_text(f"Waiting for ECG...\n\n{self.stream.status}\nR peaks detected: {n}\n\n[ESC] to quit")
+            time.sleep(0.01)
+            self.check_escape()
+        _, rr, _ = self.stream.prediction()
+        print(f"[ECG] Ready. HR = {60 / rr:.0f} bpm")
+
+    def wait_for_slot(self, earliest):
+        """Wait until beat 1 = predicted R - 270 ms falls after 'earliest'."""
+        n_late, late_r, last_warn = 0, None, core.getTime()
+        b1 = B1_BEFORE_R_MS / 1000.0
+        while True:
+            self.check_escape()
+            now = core.getTime()
+            p = self.stream.prediction()
+            if p is None or now - p[0] > NO_ECG_WARN_S:
+                if now - last_warn > 2.0:
+                    last_warn = now
+                    print(f"[ECG] *** No recent R peaks ({self.stream.status}) ***")
+                time.sleep(0.002)
+                continue
+            last_r, rr_mean, r_pred = p
+            t1 = r_pred - b1
+            if t1 < earliest:            # ITI not reached yet -> wait for the next R
+                time.sleep(0.002)
+                continue
+            if now > t1 + LATE_TOL_S:    # too late for this R -> wait for the next one
+                if late_r != last_r:
+                    n_late, late_r = n_late + 1, last_r
+                time.sleep(0.002)
+                continue
+            if t1 - now > 0.025:
+                time.sleep(0.001)
+                continue
+            return {"t1": t1, "last_r": last_r, "rr_mean": rr_mean, "r_pred": r_pred, "n_late": n_late}
+
+    def run_block(self, run_idx, cfg, n_blocks):
+        block_type, base_side = cfg['type'], cfg['side']
+        print(f"\n{'=' * 60}\nBLOCK {run_idx + 1}/{n_blocks} | TACTILE | {base_side.upper()} | "
+              f"{block_type.upper()} | STIM {'ON' if self.stim_on else 'OFF'}\n{'=' * 60}\n")
+        trials = generate_trials(block_type, base_side)
+        solution = sum(t['phase'] == 'test' and t['global_kind'] == 'GD' for t in trials)
+
+        self.show_text("ATTENTION TASK\n\n1. Eyes on cross (+).\n2. Count 'odd' sequences.\n\n[Press SPACE to begin]")
+        event.waitKeys(keyList=['space'])
+        self.fix.draw()
+        self.win.flip()          # static cross: no more flips during the block
+
+        t_block = core.getTime()
+        rows, aborted = [], False
+        earliest, last_b5 = t_block + PRE_STIM_BUFFER, None
+        try:
+            for seq_i, item in enumerate(trials):
+                iti_req = random.choice(ITI_VALUES) / 1000.0
+                if last_b5 is not None:
+                    earliest = last_b5 + iti_req
+                plan = self.wait_for_slot(earliest)
+                t_sent = []
+                for b_i, side in enumerate(item["sides"]):
+                    beat = b_i + 1
+                    target = plan["t1"] + b_i * SOA_MS / 1000.0
+                    self.wait_until(target)
+                    code = encode_trigger(beat, side, item['local_kind'], item['global_kind'])
+                    if beat in ACTIVE_BEATS:
+                        ts, out = self.send_trigger(code)
+                        print(f" >> TRIG: {decode_trigger_to_text(out)}")
+                    else:
+                        ts, out = core.getTime(), 0
+                    t_sent.append(ts)
+                    rows.append({
+                        "block_idx": run_idx + 1, "block_type": block_type, "base_side": base_side,
+                        "task_type": "tactile", "stim_on": int(self.stim_on),
+                        "seq_idx": seq_i + 1, "phase": item["phase"],
+                        "local_kind": item["local_kind"], "global_kind": item["global_kind"],
+                        "beat": beat, "side": side, "is_active": int(beat in ACTIVE_BEATS),
+                        "trigger_val": out, "trigger_desc": decode_trigger_to_text(out),
+                        "onset_time": round(ts - t_block, 4),
+                        "onset_planned": round(target - t_block, 4),
+                        "iti_req_ms": round(iti_req * 1000) if last_b5 is not None else np.nan,
+                        "iti_real_ms": round((t_sent[0] - last_b5) * 1000, 1) if last_b5 is not None else np.nan,
+                        "r_last_time": round(plan["last_r"] - t_block, 4),
+                        "rr_mean_ms": round(plan["rr_mean"] * 1000, 1),
+                        "r_pred_time": round(plan["r_pred"] - t_block, 4),
+                        "n_r_late": plan["n_late"],
+                    })
+                last_b5 = t_sent[-1]
+            self.wait_until(core.getTime() + POST_STIM_BUFFER)
+        except EscapePressed:
+            aborted = True
+        finally:
+            self.save_block(run_idx, rows, t_block)
+        print(f"\n{'#' * 50}\n   END OF BLOCK {run_idx + 1}\n{'#' * 50}\n >> TACTILE: {solution}\n{'#' * 50}\n")
+        print("[RDA] " + self.stream.latency_report())
+        return aborted
+
+    def save_block(self, run_idx, rows, t_block):
+        if not rows: return
+        df = pd.DataFrame(rows)
+        r_t, r_amp = self.stream.r_times()
+        # actual (detected) R closest to each trial's predicted R
+        b1 = df[df.beat == 1]
+        for i, row in b1.iterrows():
+            rp = row.r_pred_time + t_block
+            j = int(np.argmin(np.abs(r_t - rp))) if len(r_t) else None
+            if j is not None and abs(r_t[j] - rp) < 0.4:
+                df.loc[df.seq_idx == row.seq_idx, "r_actual_time"] = round(r_t[j] - t_block, 4)
+        if "r_actual_time" in df:
+            df["beat_minus_r_actual_ms"] = ((df.onset_time - df.r_actual_time) * 1000).round(1)
+            df["pred_error_ms"] = ((df.r_actual_time - df.r_pred_time) * 1000).round(1)
+            e = df[df.beat == 1]
+            print(f"[ECG] Beat1 - actual R: median {e.beat_minus_r_actual_ms.median():.1f} ms "
+                  f"(target {-B1_BEFORE_R_MS}), |prediction error| median "
+                  f"{e.pred_error_ms.abs().median():.1f} ms, p90 {e.pred_error_ms.abs().quantile(.9):.1f} ms")
+        if self.sim is not None and self.sim.true_r and "r_actual_time" in df:
+            tr = np.array(self.sim.true_r)
+            df["r_true_time"] = [round(tr[np.argmin(np.abs(tr - (x + t_block)))] - t_block, 4)
+                                 if not np.isnan(x) else np.nan for x in df.get("r_actual_time", np.nan)]
+        df.to_csv(os.path.join(self.out_dir, f"block_{run_idx + 1}_tactile.csv"), index=False, sep=CSV_SEP, decimal=CSV_DECIMAL)
+
+        # all R peaks detected during the block
+        t_end = t_block + df.onset_time.max() + POST_STIM_BUFFER
+        sel = (r_t >= t_block) & (r_t <= t_end)
+        rdf = pd.DataFrame({"r_time": np.round(r_t[sel] - t_block, 4), "amplitude": np.round(r_amp[sel], 2)})
+        rdf["rr_ms"] = (rdf.r_time.diff() * 1000).round(1)
+        rdf.to_csv(os.path.join(self.out_dir, f"block_{run_idx + 1}_rpeaks.csv"), index=False, sep=CSV_SEP, decimal=CSV_DECIMAL)
+
+
+def main():
+    dlg = gui.Dlg(title="LOCAL-GLOBAL ECG (TEST)")
+    dlg.addField("Subject ID:", "001")
+    dlg.addField("Electrical stimulator:", choices=["ON", "OFF"])
+    dlg.addField("ECG source:", choices=["RDA (Recorder)", "Simulation"])
+    dlg.addField("Recorder IP:", RDA_HOST_DEFAULT)
+    dlg.addField("ECG channel:", ECG_CHANNEL_DEFAULT)
+    dlg.addField("R polarity:", choices=["auto", "positive", "negative"])
+    dlg.show()
+    if not dlg.OK: core.quit()
+    subj_id, stim, src, host, ch, pol = [dlg.data[i] for i in range(6)]
+    stim_on = (stim == "ON")
+    simulate = src.startswith("Sim")
+
+    out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data_experiment", f"sub-{subj_id}", "ses-ECGtest")
+    print(f"Saving data to: {out_dir}")
+    os.makedirs(out_dir, exist_ok=True)
+
+    try:
+        port = parallel.ParallelPort(address=EEG_PORT_ADDRESS)
+        print("Parallel Port: CONNECTED (8-BIT MODE)")
+    except Exception:
+        print("Parallel Port: SIMULATION MODE")
+
+        class DummyPort:
+            def setData(self, val): pass
+        port = DummyPort()
+
+    sim = None
+    if simulate:
+        sim = RDASimServer()
+        sim.start()
+        host, rda_port, ch = "127.0.0.1", SIM_PORT, "ECG"
+        real_port = port
+
+        class SimPort:
+            def setData(self, val):
+                real_port.setData(val)
+                if val: sim.add_marker(val)
+        port = SimPort()
+    else:
+        rda_port = RDA_PORT
+
+    stream = ECGStream(host, rda_port, ch, pol)
+    stream.start()
+
+    win = visual.Window(screen=1, size=[1920, 1080], fullscr=True, monitor='testMonitor',
+                        color=BG_COLOR, units='height', allowGUI=False, winType='pyglet')
+    exp = Experiment(port, stream, stim_on, win, out_dir, sim)
+
+    configs = [("monotone", "right"), ("monotone", "left"), ("discordant", "right"), ("discordant", "left")]
+    random.shuffle(configs)
+    plan = [{"type": t, "side": s} for t, s in configs]
+
+    try:
+        for i, cfg in enumerate(plan):
+            exp.wait_for_ecg()
+            if exp.run_block(i, cfg, len(plan)):
+                print("ESCAPE: experiment interrupted (block data saved)")
+                break
+            if i < len(plan) - 1:
+                exp.show_text("BREAK\n\nRelax for a moment.\n\n[SPACE] to continue")
+                event.waitKeys(keyList=['space'])
+    except EscapePressed:
+        print("ESCAPE: experiment interrupted")
+    finally:
+        if stream.marker_log:
+            pd.DataFrame(stream.marker_log).to_csv(os.path.join(out_dir, "rda_markers.csv"), index=False, sep=CSV_SEP, decimal=CSV_DECIMAL)
+        stream.stop()
+        win.close()
+
+
+if __name__ == "__main__":
+    main()
