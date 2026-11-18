@@ -1,7 +1,7 @@
 """
 TACTILE LOCAL-GLOBAL SYNCHRONISED WITH THE ECG (test version)
 -------------------------------------------------------------
-- 4 tactile blocks (monotone/discordant x left/right), random order.
+- N_BLOCKS tactile blocks (out of monotone/discordant x left/right), random order.
 - Fixation cross only (no visual task).
 - 25 habituation + 120-130 test trials per block, 20% Global Deviants.
 - Electrical stimulator ON/OFF (start-up dialog):
@@ -47,6 +47,7 @@ from psychopy import core, parallel, gui, visual, event
 # 1. PARAMETERS
 # ==============================================================================
 # --- Experimental structure ---
+N_BLOCKS = 2                            # blocks to run (max 4; random subset of the 4 configs)
 HABITUATION_TRIALS = 25
 N_TEST_RANGE = (120, 130)
 GLOBAL_DEVIANT_PCT = 0.20
@@ -751,6 +752,7 @@ def main():
     configs = [("monotone", "right"), ("monotone", "left"), ("discordant", "right"), ("discordant", "left")]
     random.shuffle(configs)
     plan = [{"type": t, "side": s} for t, s in configs]
+    plan = plan[:N_BLOCKS]
 
     try:
         for i, cfg in enumerate(plan):
